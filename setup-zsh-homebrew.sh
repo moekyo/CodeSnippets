@@ -312,8 +312,15 @@ write_ghostty_config() {
   backup_file_if_exists "$config_path" "ghostty.config.before-setup"
 
   cat > "$config_path" <<GHOSTTY
-# 字体
+# 英文 / Powerlevel10k / Nerd Font 图标
 font-family = "MesloLGS NF"
+
+# 简体中文 fallback，避免走到日文字形
+font-family = "PingFang SC"
+
+# emoji fallback
+font-family = "Apple Color Emoji"
+
 font-size = ${GHOSTTY_FONT_SIZE}
 font-thicken = true
 adjust-cell-height = 2
@@ -330,7 +337,7 @@ palette = 6=#f3c86a
 minimum-contrast = 1.2
 
 # 窗口
-background-opacity = 0.96
+background-opacity = 0.94
 background-blur = 10
 macos-titlebar-style = transparent
 window-padding-x = 10
@@ -397,6 +404,41 @@ JSON
   log "已写入 micro 快捷键配置：$bindings_path"
 }
 
+configure_yazi_kanagawa_paper_flavor() {
+  local yazi_config_dir="$HOME/.config/yazi"
+  local theme_path="$yazi_config_dir/theme.toml"
+  local package_path="$yazi_config_dir/package.toml"
+  local flavor_dir="$yazi_config_dir/flavors/kanagawa-paper.yazi"
+  local pkg_output=""
+
+  if ! command -v ya >/dev/null 2>&1; then
+    fail "未找到 ya 命令，无法安装 Yazi 主题 kanagawa-paper。请确认 yazi 已通过 Homebrew 安装成功。"
+  fi
+
+  mkdir -p "$yazi_config_dir"
+
+  log "安装或确认 Yazi 主题：melindachang/kanagawa-paper"
+  if ! pkg_output="$(ya pkg add melindachang/kanagawa-paper 2>&1)"; then
+    if [[ -d "$flavor_dir" || ( -f "$package_path" && "$(cat "$package_path")" == *kanagawa-paper* ) ]]; then
+      log "Yazi 主题已存在，跳过安装：melindachang/kanagawa-paper"
+    else
+      printf '%s\n' "$pkg_output" >&2
+      fail "安装 Yazi 主题失败：melindachang/kanagawa-paper"
+    fi
+  elif [[ -n "$pkg_output" ]]; then
+    printf '%s\n' "$pkg_output"
+  fi
+
+  backup_file_if_exists "$theme_path" "yazi.theme.toml.before-setup"
+
+  cat > "$theme_path" <<'TOML'
+[flavor]
+dark = "kanagawa-paper"
+TOML
+
+  log "已写入 Yazi 主题配置：$theme_path"
+}
+
 configure_git_diff_tools() {
   if ! command -v git >/dev/null 2>&1; then
     warn "未找到 git，跳过 git-delta / difftastic 的 git 配置"
@@ -407,8 +449,13 @@ configure_git_diff_tools() {
   touch "$HOME/.gitignore_global"
 
   git config --global core.excludesfile "$HOME/.gitignore_global"
+  # 使用 delta 渲染 git diff，并显式指定 less 支持鼠标滚轮 / 触控板滚动。
+  # -R 保留 ANSI 颜色；--mouse 接收鼠标滚轮事件；--wheel-lines 控制每次滚动行数。
   git config --global core.pager delta
+  # delta 内建 pager：直接配置在 [delta] 段，不依赖 shell 环境变量
+  git config --global delta.pager 'less -R --mouse --wheel-lines=1'
   git config --global interactive.diffFilter 'delta --color-only'
+  git config --global --unset-all delta.paging >/dev/null 2>&1 || true
 
   git config --global delta.navigate true
   git config --global delta.side-by-side true
@@ -425,9 +472,11 @@ configure_git_diff_tools() {
 
   git config --global merge.conflictStyle zdiff3
   git config --global difftool.difftastic.cmd 'difft "$LOCAL" "$REMOTE"'
-  git config --global alias.df '!GIT_EXTERNAL_DIFF=difft git diff'
-  git config --global alias.dfs '!GIT_EXTERNAL_DIFF=difft git diff --staged'
-  git config --global alias.dfh '!GIT_EXTERNAL_DIFF=difft git diff HEAD'
+  # difftastic 使用 diff.external 接入；显式 override core.pager 直连 less，
+  # 绕过 delta，避免 delta 对 difft 输出做不必要的 pass-through。
+  git config --global alias.df '!GIT_EXTERNAL_DIFF=difft git -c core.pager="less -R --mouse --wheel-lines=1" diff'
+  git config --global alias.dfs '!GIT_EXTERNAL_DIFF=difft git -c core.pager="less -R --mouse --wheel-lines=1" diff --staged'
+  git config --global alias.dfh '!GIT_EXTERNAL_DIFF=difft git -c core.pager="less -R --mouse --wheel-lines=1" diff HEAD'
 
   log "已写入 git-delta / difftastic 的 git 配置"
 }
@@ -531,8 +580,10 @@ fi
 install_ghostty_if_needed
 
 write_micro_bindings
+configure_yazi_kanagawa_paper_flavor
 configure_git_diff_tools
 
+# NOTE: ~/.zshrc 生成
 cat > "$NEW_ZSHRC_TMP" <<'ZSHRC'
 # Powerlevel10k instant prompt。保持在文件顶部附近。
 if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
@@ -632,12 +683,98 @@ if [[ -x "$HOME/.miniforge3/bin/mamba" ]]; then
   unset __mamba_setup
 fi
 
-alias orunv='ollama run --verbose'
 alias mc='micro'
 alias oc='opencode'
 alias lg='lazygit'
-alias pic='cd ~/.pi-scratch && pi'
-alias picc='cd ~/.pi-scratch && pi -c'
+
+# 终端异常恢复：方向键显示 ^[[A、输入乱码、回车/退格异常、TUI 异常退出后可用。
+fixterm() {
+  stty sane 2>/dev/null || true
+  reset
+  exec zsh
+}
+
+# Pi：每天第一次启动 Pi 会话前自动更新一次。
+# 配置同步由 Pi 启动后加载的 ~/Development/Pi-Sync/pi/extensions/auto-sync.ts 负责。
+# 首次使用前需要先运行 ~/Development/Pi-Sync/bootstrap.sh，把 auto-sync.ts 链接到 Pi 扩展目录。
+# 通过 PI_SYNC_COMMAND 可以额外指定启动前同步命令；默认不额外同步。
+# 通过 PI_AUTO_UPDATE=0 可以临时跳过自动更新，例如：PI_AUTO_UPDATE=0 pi
+# 通过 PI_AUTO_UPDATE_COMMAND 可以覆盖更新命令，默认是：command pi update
+_pi_should_auto_update() {
+  case "${1:-}" in
+    "")
+      return 0
+      ;;
+    --help|-h|--version|-v)
+      return 1
+      ;;
+    -*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+_pi_auto_update_once_per_day() {
+  [[ "${PI_AUTO_UPDATE:-1}" == "0" ]] && return 0
+
+  local stamp_dir="$HOME/.cache/pi"
+  local stamp_file="$stamp_dir/last-auto-update"
+  local today
+  today="$(date +%Y-%m-%d)"
+
+  mkdir -p "$stamp_dir"
+
+  if [[ -f "$stamp_file" && "$(command cat "$stamp_file" 2>/dev/null)" == "$today" ]]; then
+    return 0
+  fi
+
+  echo "🔄 Pi: 今天第一次启动 Pi 会话，先自动更新..."
+
+  local sync_status=0
+  if [[ -n "${PI_SYNC_COMMAND:-}" ]]; then
+    eval "$PI_SYNC_COMMAND" || sync_status=$?
+  fi
+
+  if [[ $sync_status -ne 0 ]]; then
+    echo "⚠️ Pi: 启动前额外同步失败，继续执行 Pi 更新"
+  fi
+
+  if [[ -n "${PI_AUTO_UPDATE_COMMAND:-}" ]]; then
+    eval "$PI_AUTO_UPDATE_COMMAND"
+  else
+    command pi update
+  fi
+
+  local update_status=$?
+  if [[ $sync_status -eq 0 && $update_status -eq 0 ]]; then
+    echo "$today" > "$stamp_file"
+    echo "✅ Pi: 自动更新完成，继续启动"
+  else
+    echo "⚠️ Pi: 自动更新未完全成功，继续启动 Pi"
+  fi
+
+  return 0
+}
+
+pi() {
+  if _pi_should_auto_update "$@"; then
+    _pi_auto_update_once_per_day
+  fi
+  command pi "$@"
+}
+
+pic() {
+  builtin cd ~/.pi-scratch || return
+  pi "$@"
+}
+
+picc() {
+  builtin cd ~/.pi-scratch || return
+  pi -c "$@"
+}
 
 ZSHRC
 
@@ -727,19 +864,6 @@ cat <<SUMMARY
   基础工具：        ${BASE_FORMULAS[*]}
   现代 CLI：       ${MODERN_FORMULAS[*]}
 
-下一步：
-  1. 重启当前 shell：
-       exec zsh
-
-  2. 重启 Ghostty，或者在 Ghostty 里重新加载配置：
-       Cmd + Shift + ,
-
-  3. 如果 Powerlevel10k 图标显示异常，执行：
-       p10k configure
-
-  4. 如果下拉终端全局快捷键不生效，请给 Ghostty 开启辅助功能权限：
-       系统设置 > 隐私与安全性 > 辅助功能 > Ghostty
-
 常用命令：
   fzf：        Ctrl+R 搜索历史命令，Ctrl+T 搜索文件
   zoxide：     z <目录关键词>
@@ -748,9 +872,12 @@ cat <<SUMMARY
   yazi：       y
   micro：      mc <文件>
   lazygit：    lg
-  git-delta：  git diff / git show 时自动使用 delta
-  difftastic： git df、git dfs、git dfh
+  git-delta：  git diff / git show 时自动使用 delta；通过 delta.pager 配置 less --mouse --wheel-lines=1，支持滚轮/触控板滚动，按 q 退出
+  difftastic： git df、git dfs、git dfh；使用 GIT_EXTERNAL_DIFF=difft，并显式 override core.pager 直连 less --mouse --wheel-lines=1，绕过 delta，支持滚轮/触控板滚动
   mole：       mole --help
+  Pi：         pi 每天第一次启动 Pi 会话前先更新；auto-sync.ts 由 Pi-Sync/bootstrap.sh 接入；PI_AUTO_UPDATE=0 pi 可临时跳过
+  Pi scratch： pic 进入 ~/.pi-scratch 后启动 pi；picc 进入 ~/.pi-scratch 后启动 pi -c
+  fixterm：    终端输入乱码、方向键显示 ^[[A、TUI 异常退出后，执行 fixterm 恢复当前终端
   auto_cd：    直接输入目录名即可进入目录，例如：Downloads
 
 Ghostty 分屏快捷键：
@@ -762,6 +889,8 @@ Ghostty 分屏快捷键：
 验证：
   ghostty +show-config | grep -E '^(font-family|font-size|theme|minimum-contrast|background-opacity|background-blur|quick-terminal|keybind = .*quick_terminal)'
   echo \$PATH
+  git config --global --get core.pager
+  git config --global --get delta.paging
 
 恢复：
   恢复 zshrc：
@@ -779,10 +908,28 @@ Ghostty 分屏快捷键：
   如果备份过 micro 快捷键配置，可以恢复：
     cp '$BACKUP_DIR/micro.bindings.json.before-setup' ~/.config/micro/bindings.json
 
+  如果备份过 Yazi 主题配置，可以恢复：
+    cp '$BACKUP_DIR/yazi.theme.toml.before-setup' ~/.config/yazi/theme.toml
+
   如果备份过 Ghostty 配置，可以恢复：
     cp '$BACKUP_DIR/ghostty.config.before-setup' '${GHOSTTY_CONFIG_WRITTEN:-/path/to/ghostty/config}'
 
   如果备份过 Oh My Zsh，可以恢复：
     tar -xzf '$BACKUP_DIR/oh-my-zsh.tar.gz' -C ~
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+下一步：
+  1. 现在执行下面这条命令，让新的 ~/.zshrc 立即生效：
+       exec zsh
+
+  2. 重启 Ghostty，或者在 Ghostty 里重新加载配置：
+       Cmd + Shift + ,
+
+  3. 如果 Powerlevel10k 图标显示异常，执行：
+       p10k configure
+
+  4. 如果下拉终端全局快捷键不生效，请给 Ghostty 开启辅助功能权限：
+       系统设置 > 隐私与安全性 > 辅助功能 > Ghostty
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 SUMMARY
